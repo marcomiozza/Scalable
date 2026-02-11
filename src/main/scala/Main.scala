@@ -3,7 +3,7 @@ import java.time.LocalDate
 
 object Main {
 
-  // Implicit ordering per LocalDate
+  // Ordinamento implicito per LocalDate basato sui giorni dall'epoca
   implicit val localDateOrdering: Ordering[LocalDate] = Ordering.by(_.toEpochDay)
   
   case class Location(lat: Double, lon: Double) {
@@ -11,6 +11,8 @@ object Main {
   }
   
   case class LocationPair(loc1: Location, loc2: Location) {
+    // Normalizza la coppia per garantire un ordine consistente
+    // (importante per il conteggio delle co-occorrenze)
     def normalized: LocationPair = {
       if (loc1.lat < loc2.lat || (loc1.lat == loc2.lat && loc1.lon <= loc2.lon))
         this
@@ -29,12 +31,14 @@ object Main {
 
     val inputPath = args(0)
     val outputPath = args(1)
+    // Se non specificato, usa 3x il parallelismo di default
     val numPartitions =
       if (args.length > 2) args(2).toInt else sc.defaultParallelism * 3
 
     val startTime = System.currentTimeMillis()
 
-    // Caricamento e parsing
+    // Carica CSV e arrotonda coordinate a 0.1 gradi di precisione
+    // Raggruppa per (lat, lon, data) eliminando duplicati nello stesso giorno
     val events = spark.read
       .option("header", value = true)
       .csv(inputPath)
@@ -50,7 +54,8 @@ object Main {
       .map { case ((lat, lon, date), _) => (date, Location(lat, lon)) }
       .cache()
     
-    // Raggruppa per data con aggregateByKey
+    // Raggruppa per data creando un Set di Location per ogni giorno
+    // Filtra solo i giorni con almeno 2 eventi (altrimenti non ci sono coppie)
     val eventsByDate = events
       .aggregateByKey(Set.empty[Location])(
         (set, loc) => set + loc,
@@ -59,7 +64,8 @@ object Main {
       .filter(_._2.size > 1)
       .cache()
     
-    // Genera coppie e conta co-occorrenze
+    // Genera tutte le coppie di location per ogni data e conta le co-occorrenze
+    // normalized() garantisce che (A,B) e (B,A) siano trattate come la stessa coppia
     val pairCounts = eventsByDate
       .flatMap { case (_, locations) =>
         val locList = locations.toList
@@ -70,12 +76,13 @@ object Main {
       }
       .reduceByKey(_ + _)
     
-    // Trova coppia vincente
+    // Trova la coppia con il maggior numero di co-occorrenze
     val (winningPair, maxCount) = pairCounts.reduce { (a, b) => 
       if (a._2 > b._2) a else b 
     }
     
-    // Trova date co-occorrenze con sort distribuito
+    // Estrae tutte le date in cui la coppia vincente è co-occorsa
+    // e le ordina cronologicamente
     val winningDates = eventsByDate
       .filter { case (_, locations) =>
         locations.contains(winningPair.loc1) && locations.contains(winningPair.loc2)
@@ -86,12 +93,14 @@ object Main {
     
     val executionTime = System.currentTimeMillis() - startTime
     
-    // Output risultato
+    // Salva i risultati: prima la coppia vincente, poi le date
     val result = Seq(winningPair.toString) ++ winningDates.map(_.toString)
     sc.parallelize(result, 1).saveAsTextFile(s"$outputPath/result")
     
+    // Salva il tempo di esecuzione separatamente
     sc.parallelize(Seq(executionTime.toString), 1).saveAsTextFile(s"$outputPath/time")
     
+    // Libera la memoria cache
     events.unpersist()
     eventsByDate.unpersist()
     
